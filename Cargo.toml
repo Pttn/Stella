@@ -1,7 +1,12 @@
 [package]
 name = "stella"
-version = "0.0.0"
+version = "0.0.1"
 edition = "2021"
+authors = ["Pttn"]
+description = "Stella is a software that finds prime k-tuplets (also called prime constellations)."
+license = "MIT"
+homepage = "https://forum.riecoin.dev/viewtopic.php?t=114"
+repository = "https://github.com/Pttn/Stella"
 
 [dependencies]
-rug = "^1.19.0"
+rug = "^1.19.2"
