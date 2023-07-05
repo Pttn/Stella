@@ -37,6 +37,7 @@ pub const DEFAULT_PRIMORIAL_OFFSETS: &'static [(&'static [isize], u128)] = &[
 ];
 
 // Struct for results of interest found by a Stella instance (actual prime k-tuplet, long enough tuple, or pool share).
+#[derive(Clone)]
 pub struct Output {
 	pub n: Integer,
 	pub k: usize,
