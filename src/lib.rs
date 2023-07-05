@@ -1,4 +1,4 @@
-// (c) 2023 Pttn (Stelo.xyz/Riecoin.dev)
+// (c) 2023 Pttn (Stelo.xyz/Riecoin.dev) and contributors
 
 use rug::Integer;
 use std::collections::VecDeque;

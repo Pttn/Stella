@@ -14,7 +14,7 @@ The Stella interface relies on the Rug's Integer structure, so add the following
 
 ```
 rug = "^1.19.0"
-stella = "0.0.1"
+stella = "0.0.2"
 ```
 
 Optionally, you can use the following imports in your source files, we will assume that you did that below.
