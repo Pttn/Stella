@@ -1,6 +1,6 @@
 [package]
 name = "stella"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2021"
 authors = ["Pttn and contributors"]
 description = "Stella is a software that finds prime k-tuplets (also called prime constellations)."

@@ -1,9 +1,10 @@
 // (c) 2023 Pttn (Stelo.xyz/Riecoin.dev) and contributors
 
 use rug::Integer;
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::mem::size_of;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Condvar};
 use std::thread;
 use std::thread::available_parallelism;
 use std::time::Instant;
@@ -36,12 +37,57 @@ pub const DEFAULT_PRIMORIAL_OFFSETS: &'static [(&'static [isize], u128)] = &[
 	(&[0, 6, 10, 12, 16, 22, 24, 30, 34, 36, 40, 42], 1418575498567)
 ];
 
+// Struct containing the relevant information for a job submitted to the Stella instance
+#[derive(Clone)]
+pub struct Job {
+	pub id: usize,
+	pub clear_previous_jobs: bool,
+	pub pattern: Vec<isize>,
+	pub target_min: Integer,
+	pub target_max: Integer,
+	pub k_min: usize,
+	pub pattern_min: Vec<bool>,
+}
+
+#[derive(PartialEq)] enum TaskType {Sieve, Check}
+const MAX_CANDIDATES_PER_CHECK_TASK: usize = 64;
+// Struct containing the relevant information for internal tasks created to do the Jobs
+struct Task {
+	pub t: TaskType,
+	pub job_id: usize,
+	pub primorial_factor_start: usize,
+	pub primorial_factor_max: usize,
+	pub factors_candidates: Vec<usize>
+}
+
+impl Task {
+	fn new_sieve(job_id: usize, primorial_factor_start: usize, primorial_factor_max: usize) -> Task {
+		return Task {
+			t: TaskType::Sieve,
+			job_id: job_id,
+			primorial_factor_start: primorial_factor_start,
+			primorial_factor_max: primorial_factor_max,
+			factors_candidates: vec![]
+		}
+	}
+	
+	fn new_check(job_id: usize, primorial_factor_start: usize, factors_candidates: Vec<usize>) -> Task {
+		return Task {
+			t: TaskType::Check,
+			job_id: job_id,
+			primorial_factor_start: primorial_factor_start,
+			primorial_factor_max: 0,
+			factors_candidates: factors_candidates
+		}
+	}
+}
+
 // Struct for results of interest found by a Stella instance (actual prime k-tuplet, long enough tuple, or pool share).
 #[derive(Clone)]
 pub struct Output {
 	pub n: Integer,
-	pub k: usize,
-	pub constellation_pattern: Vec<isize>,
+	pub pattern: Vec<isize>,
+	pub job_id: usize,
 	pub worker_id: usize
 }
 
@@ -50,24 +96,22 @@ pub struct Output {
 pub struct Params {
 	pub workers: usize,
 	pub constellation_pattern: Vec<isize>,
-	pub target: Integer,
 	pub prime_table_limit: usize,
 	pub primorial_number: usize,
 	pub primorial_offset: u128,
 	pub sieve_size: usize,
 }
 
-impl Params {
-	pub fn new() -> Params {
+impl Default for Params {
+    fn default() -> Params {
 		return Params {
 			workers: 0,
 			constellation_pattern: vec![],
-			target: Integer::from(0),
 			prime_table_limit: 0,
 			primorial_number: 0,
 			primorial_offset: 0,
 			sieve_size: 0
-		};
+		}
 	}
 }
 
@@ -103,9 +147,17 @@ impl Stats {
 
 // Struct used by workers for sieving.
 struct Sieve {
-	first_candidate: Integer,
-	factors_eliminated: Vec<usize>,
-	factors_candidates: Vec<usize>,
+	factors_to_eliminate: Vec<usize>,
+	factors_eliminated: Vec<usize>
+}
+
+impl Sieve {
+	pub fn new() -> Sieve {
+		return Sieve {
+			factors_to_eliminate: vec![],
+			factors_eliminated: vec![]
+		};
+	}
 }
 
 // Main structure for the library user, handles a customizable search of Prime Constellations.
@@ -116,6 +168,10 @@ pub struct Stella {
 	modular_inverses: Arc<Vec<usize>>,
 	primorial: Integer,
 	
+	jobs: Arc<Mutex<HashMap<usize, Job>>>,
+	tasks: Arc<Mutex<VecDeque<Task>>>,
+	cv: Arc<Condvar>,
+	
 	stats: Arc<Mutex<Stats>>,
 	output: Arc<Mutex<VecDeque<Output>>>,
 }
@@ -123,10 +179,13 @@ pub struct Stella {
 impl Stella {
 	pub fn new() -> Stella {
 		return Stella {
-			params: Params::new(),
+			params: Params::default(),
 			primes: Arc::new(vec![]),
 			modular_inverses: Arc::new(vec![]),
 			primorial: Integer::from(1),
+			jobs: Arc::new(Mutex::new(HashMap::new())),
+			tasks: Arc::new(Mutex::new(VecDeque::new())),
+			cv: Arc::new(Condvar::new()),
 			stats: Arc::new(Mutex::new(Stats::new())),
 			output: Arc::new(Mutex::new(VecDeque::new()))
 		};
@@ -152,11 +211,11 @@ impl Stella {
 			self.params.constellation_pattern = params.constellation_pattern;
 		}
 		
-		if params.target == 0 {
-			self.params.target = Integer::from(1) << 1024;
+		if params.primorial_number == 0 {
+			self.params.primorial_number = 120;
 		}
 		else {
-			self.params.target = params.target;
+			self.params.primorial_number = params.primorial_number;
 		}
 		
 		if params.prime_table_limit == 0 {
@@ -164,13 +223,6 @@ impl Stella {
 		}
 		else {
 			self.params.prime_table_limit = params.prime_table_limit;
-		}
-		
-		if params.primorial_number == 0 {
-			self.params.primorial_number = 120;
-		}
-		else {
-			self.params.primorial_number = params.primorial_number;
 		}
 		
 		if params.primorial_offset == 0 { // Pick a default Primorial Offset if none was chosen, if possible
@@ -187,7 +239,7 @@ impl Stella {
 			self.params.sieve_size = 1 << 25;
 		}
 		else {
-			self.params.sieve_size = params.sieve_size;
+			self.params.sieve_size = (params.sieve_size/WORD_SIZE)*WORD_SIZE;
 		}
 	}
 	
@@ -218,6 +270,8 @@ impl Stella {
 			let sieve_size = self.params.sieve_size.clone();
 			let sieve_words = sieve_size/WORD_SIZE;
 			let output = self.output.clone();
+			let tasks = self.tasks.clone();
+			let cv = self.cv.clone();
 			self.stats.lock().unwrap().search_start_instant = Instant::now();
 			self.stats.lock().unwrap().sieving_duration = 0f64;
 			self.stats.lock().unwrap().candidates_generated = 0;
@@ -225,73 +279,160 @@ impl Stella {
 			self.stats.lock().unwrap().candidates_tested = 0;
 			self.stats.lock().unwrap().tuple_counts = vec![0; constellation_pattern.len() + 1];
 			let stats = self.stats.clone();
-			let target = self.params.target.clone() + worker_id*sieve_size*primorial.clone();
+			let mut sieve = Sieve::new();
+			sieve.factors_to_eliminate = vec![0 ; self.params.constellation_pattern.len()*self.primes.len()];
+			sieve.factors_eliminated = vec![0 ; sieve_words];
+			let jobs = self.jobs.clone();
 			let _ = thread::Builder::new().name(format!("Worker {0}", worker_id)).spawn(move || {
-				// The first candidate is the first multiple of the primorial after the target + the primorial offset
-				// The candidates have the form first_candidate + f × primorial
-				let mut sieve = Sieve {
-					first_candidate: target.clone() + primorial.clone() - (target.clone() % primorial.clone()) + primorial_offset,
-					factors_eliminated: vec![0; sieve_words],
-					factors_candidates: vec![]
-				};
 				let mut timer_instant;
 				loop {
-					timer_instant = Instant::now();
-					// Eliminate the factors f
-					for i in params.primorial_number .. primes.len() {
-						for o in &constellation_pattern {
-							let mut fp = (((primes[i] - ((sieve.first_candidate.clone() + o) % primes[i]))*modular_inverses[i]) % primes[i]).to_usize().unwrap();
-							while fp < sieve_size {
-								sieve.factors_eliminated[fp/WORD_SIZE] |= 1 << (fp % WORD_SIZE); // Mark as eliminated by changing the bit from 0 to 1 (if not already eliminated)
-								fp += primes[i];
+					let task;
+					{
+						let mut tasks = tasks.lock().unwrap();
+						while tasks.is_empty() {
+							tasks = cv.wait(tasks).unwrap();
+						}
+						task = tasks.pop_front().unwrap();
+					}
+					let job;
+					let tmp = jobs.lock().unwrap().clone();
+					match tmp.get(&task.job_id) {
+						Some(tmp) => {job = tmp;}
+						None => {continue;} // Job is no longer current, ignore Task
+					}
+					if task.t == TaskType::Sieve {
+						timer_instant = Instant::now();
+						let target = job.target_min.clone();
+						let primorial_factor_start = task.primorial_factor_start;
+						let primorial_factor_max = task.primorial_factor_max;
+						let adjusted_primorial_factor_max = std::cmp::min(sieve_size, ((primorial_factor_max - primorial_factor_start)/WORD_SIZE)*WORD_SIZE);
+						// The candidates have the form first_candidate + f × primorial
+						let first_candidate = target.clone() + primorial.clone() - (target.clone() % primorial.clone()) + primorial_offset + primorial_factor_start*primorial.clone();
+						for i in params.primorial_number .. primes.len() {
+							for f in 0 .. constellation_pattern.len() {
+								sieve.factors_to_eliminate[constellation_pattern.len()*i + f] = (((primes[i] - ((first_candidate.clone() + constellation_pattern[f]) % primes[i]))*modular_inverses[i]) % primes[i]).to_usize().unwrap();
 							}
 						}
-					}
-					// Extract the factors from the sieve
-					for i in params.primorial_number .. sieve.factors_eliminated.len() {
-						let mut sieve_word = !sieve.factors_eliminated[i];
-						while sieve_word != 0 {
-							let n_eliminated_until_next = sieve_word.trailing_zeros() as usize;
-							let candidate_factor = WORD_SIZE*i + n_eliminated_until_next;
-							sieve.factors_candidates.push(candidate_factor);
-							sieve_word &= sieve_word - 1; // Change the candidate's bit from 1 to 0.
+						// Make next Sieve Task
+						if primorial_factor_max > adjusted_primorial_factor_max {
+							tasks.lock().unwrap().push_back(Task::new_sieve(job.id, primorial_factor_start + adjusted_primorial_factor_max, primorial_factor_max));
+							cv.notify_all();
 						}
-					}
-					stats.lock().unwrap().sieving_duration += time_since(timer_instant);
-					stats.lock().unwrap().candidates_generated += sieve.factors_candidates.len();
-					timer_instant = Instant::now();
-					// Check whether the candidates first_candidate + f × primorial are indeed prime constellations
-					for i in 0 .. sieve.factors_candidates.len() {
-						stats.lock().unwrap().tuple_counts[0] += 1;
-						let mut k = 0;
-						let candidate = &sieve.first_candidate + &Integer::from(sieve.factors_candidates[i])*primorial.clone();
-						for o in &constellation_pattern {
-							if is_prime_fermat(&(candidate.clone() + o)) {
-								k += 1;
-								stats.lock().unwrap().tuple_counts[k] += 1;
-								if k >= constellation_pattern.len() {
-									output.lock().unwrap().push_back(Output{
-										n: candidate.clone(),
-										k: k,
-										constellation_pattern: constellation_pattern.clone(),
-										worker_id: worker_id
-									})
+						// Eliminate primorial factors of the form p*m + fp for every m*p in the current table.
+						for i in params.primorial_number .. primes.len() {
+							for f in 0 .. constellation_pattern.len() {
+								let fp = &mut sieve.factors_to_eliminate[constellation_pattern.len()*i + f];
+								while *fp < adjusted_primorial_factor_max {
+									sieve.factors_eliminated[*fp/WORD_SIZE] |= 1 << (*fp % WORD_SIZE);
+									*fp += primes[i];
 								}
 							}
-							else {
-								break;
+						}
+						// Extract the factors from the sieve
+						let mut factors_candidates = vec![];
+						for i in params.primorial_number .. (adjusted_primorial_factor_max/WORD_SIZE) {
+							let mut sieve_word = !sieve.factors_eliminated[i];
+							while sieve_word != 0 {
+								let n_eliminated_until_next = sieve_word.trailing_zeros() as usize;
+								let candidate_factor = WORD_SIZE*i + n_eliminated_until_next;
+								factors_candidates.push(candidate_factor);
+								sieve_word &= sieve_word - 1; // Change the candidate's bit from 1 to 0.
+								// Make a Check Task once we have a batch of MAX_CANDIDATES_PER_CHECK_TASK Candidates
+								if factors_candidates.len() == MAX_CANDIDATES_PER_CHECK_TASK {
+									tasks.lock().unwrap().push_front(Task::new_check(task.job_id, primorial_factor_start, factors_candidates.clone()));
+									cv.notify_all();
+									stats.lock().unwrap().candidates_generated += MAX_CANDIDATES_PER_CHECK_TASK;
+									factors_candidates = vec![];
+								}
 							}
 						}
+						// Check Task for remaining Candidates
+						if factors_candidates.len() > 0 {
+							tasks.lock().unwrap().push_front(Task::new_check(task.job_id, primorial_factor_start, factors_candidates.clone()));
+							cv.notify_all();
+							stats.lock().unwrap().candidates_generated += factors_candidates.len();
+						}
+						sieve.factors_eliminated = vec![0 ; sieve_words];
+						stats.lock().unwrap().sieving_duration += time_since(timer_instant);
 					}
-					stats.lock().unwrap().testing_duration += time_since(timer_instant);
-					stats.lock().unwrap().candidates_tested += sieve.factors_candidates.len();
-					// Sieving and primality testing of the candidates finished, start over with new target
-					sieve.first_candidate += primorial.clone()*sieve_size*workers;
-					sieve.factors_eliminated = vec![0; sieve_words];
-					sieve.factors_candidates = vec![];
+					else if task.t == TaskType::Check {
+						timer_instant = Instant::now();
+						// Check whether the candidates first_candidate + f × primorial are indeed prime constellations
+						let target = job.target_min.clone();
+						let primorial_factor_start = task.primorial_factor_start;
+						let first_candidate = target.clone() + primorial.clone() - (target.clone() % primorial.clone()) + primorial_offset + primorial_factor_start*primorial.clone();
+						for i in 0 .. task.factors_candidates.len() {
+							stats.lock().unwrap().tuple_counts[0] += 1;
+							let mut k = 0;
+							let candidate = first_candidate.clone() + &Integer::from(task.factors_candidates[i])*primorial.clone();
+							let mut output_pattern = vec![];
+							for f in 0 .. job.pattern.len() {
+								if is_prime_fermat(&(candidate.clone() + job.pattern[f])) {
+									k += 1;
+									output_pattern.push(job.pattern[f]);
+									stats.lock().unwrap().tuple_counts[k] += 1;
+								}
+								else if !job.pattern_min[f] {
+									if k + job.pattern.len() - f < job.k_min {
+										break;
+									}
+								}
+								else {
+									break;
+								}
+							}
+							if k >= job.k_min {
+								output.lock().unwrap().push_front(Output{
+									n: candidate.clone(),
+									pattern: output_pattern.clone(),
+									job_id: job.id,
+									worker_id: worker_id
+								})
+							}
+						}
+						stats.lock().unwrap().testing_duration += time_since(timer_instant);
+						stats.lock().unwrap().candidates_tested += task.factors_candidates.len();
+					}
 				}
 			});
 		}
+	}
+	
+	pub fn add_job(&mut self, job: Job) -> (Vec<String>, Vec<String>) {
+		let (mut warnings, mut errors) = (vec![], vec![]);
+		if self.jobs.lock().unwrap().contains_key(&job.id) {
+			errors.push(format!("A Job {} was already added to the Stella instance.", job.id).to_string());
+		}
+		if job.pattern.len() != job.pattern_min.len() {
+			errors.push(format!("The target pattern {:?} and minimum pattern {:?} Vecs must have the same size.", job.pattern, job.pattern_min).to_string());
+		}
+		if job.k_min > job.pattern.len() {
+			errors.push(format!("The minimum tuple length {} must not exceed the constellation pattern length {}.", job.k_min, job.pattern.len()).to_string());
+		}
+		if job.target_max < job.target_min {
+			errors.push("The target upper bound must be higher than the target lower bound.".to_string());
+			return (warnings, errors);
+		}
+		let primorial = self.primorial.clone();
+		let primorial_factor_max = match ((job.target_max.clone() - job.target_min.clone())/primorial.clone()).to_usize() {
+			Some(primorial_factor_max) => primorial_factor_max,
+			_ => {
+				warnings.push(format!("The primorial factor limit exceeds usize::MAX = {}, the search will stop before the target max. Consider increasing the Primorial Number.", usize::MAX).to_string());
+				usize::MAX
+			}
+		};
+		if primorial_factor_max == 0 {
+			errors.push("The Primorial Number is too big.".to_string());
+		}
+		if errors.len() == 0 {
+			if job.clear_previous_jobs {
+				self.jobs.lock().unwrap().clear();
+			}
+			self.jobs.lock().unwrap().insert(job.id, job.clone());
+			self.tasks.lock().unwrap().push_back(Task::new_sieve(job.id, 0, primorial_factor_max));
+			self.cv.notify_all();
+		}
+		return (warnings, errors);
 	}
 	
 	pub fn pop_output(&mut self) -> Option<Output> {

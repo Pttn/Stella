@@ -13,31 +13,20 @@ fn main() {
 	println!("----------------------------------------------------------------");
 	// Create a Stella instance
 	let mut stella = Stella::new();
-	// Configure the Stella instance
-	/*stella.set_params(stella::Params { // Use Default Parameters
-		workers: 0,
-		constellation_pattern: vec![],
-		target: Integer::from(0),
-		prime_table_limit: 0,
-		primorial_number: 0,
-		primorial_offset: 0,
-		sieve_size: 0
-	});*/
-	stella.set_params(stella::Params { // Use concrete Parameters
+	// Configure the Stella instance with parameters suitable for the jobs it will take.
+	stella.set_params(stella::Params {
 		workers: 8,
-		constellation_pattern: vec![0, 2, 6, 8, 12, 18, 20, 26],
+		constellation_pattern: vec![0, 2, 6, 8, 12, 18, 20, 26], // Sieve Candidates for this Pattern
 		prime_table_limit: 10000000,
-		primorial_number: 20,
-		primorial_offset: 0,
-		target: Integer::from(1) << 128,
-		sieve_size: 10000000
+		primorial_number: 100,
+		// primorial_offset: 0,
+		sieve_size: 10000000,
+		..Default::default() // Use this if you don't want to set some parameters (like primorial_offset here)
 	});
 	// Check the Parameters
 	let params = stella.params();
 	println!("Workers: {}", params.workers);
 	println!("Constellation Pattern: {:?}", params.constellation_pattern);
-	if params.target < 1e18 {println!("Target: {}", params.target);}
-	else {println!("Target: {:.12e}", params.target);}
 	println!("Prime Table Limit: {}", params.prime_table_limit);
 	println!("Primorial Number: {}", params.primorial_number);
 	println!("Primorial Offset: {}", params.primorial_offset);
@@ -49,8 +38,6 @@ fn main() {
 	let stats = stella.stats();
 	println!("Table of {} primes generated in {:.6} s.", stats.prime_table_size, stats.prime_table_generation_time);
 	println!("Table of modular inverses generated in {:.6} s.", stats.modular_inverses_generation_time);
-	if params.target < 1e18 {println!("Target: {}", params.target);}
-	else {println!("Target: {:.12e}", params.target);}
 	let primorial = stella.primorial();
 	if primorial < 1e18 {println!("Primorial: {0}", primorial);}
 	else {println!("Primorial: {0:.12e}", primorial);}
@@ -58,6 +45,23 @@ fn main() {
 	println!("[{:.1}] Started Search", time_since(stella.stats().search_start_instant));
 	// Start Worker Threads
 	stella.start_workers();
+	// Add a Job and check for possible issues with it
+	let (warnings, errors) = stella.add_job(stella::Job {
+		id: 1,
+		clear_previous_jobs: true,
+		pattern: (&params.constellation_pattern[0 .. params.constellation_pattern.len() - 1]).to_vec(), // Check Candidates for this pattern
+		target_min: Integer::from(1) << 1024,
+		target_max: (Integer::from(1) << 1024) + (Integer::from(1) << 768),
+		k_min: params.constellation_pattern.len() - 2,
+		pattern_min: vec![true ; params.constellation_pattern.len() - 1] // All true: stop checking a Candidate as soon as one of the number is not prime
+		// pattern_min: vec![true, true, false, false, false, false, false] // Use something like this if doing Riecoin Pooled Mining
+	});
+	if !warnings.is_empty() {
+		println!("Warnings(s): {:?}", warnings);
+	}
+	if !errors.is_empty() {
+		println!("Error(s): {:?}", errors);
+	}
 	// Manage Worker Threads, Show Stats, Handle Outputs...
 	let refresh_interval = 5f64;
 	let mut timer = Instant::now();
@@ -68,7 +72,7 @@ fn main() {
 		loop {
 			match stella.pop_output() {
 				Some(output) => {
-					println!("[{:.1}] {}-tuple found by thread {}: {} + {:?}", duration, output.k, output.worker_id, output.n, output.constellation_pattern);
+					println!("[{:.1}] {}-tuple found by thread {}: {} + {:?}", duration, output.pattern.len(), output.worker_id, output.n, output.pattern);
 				},
 				None => break
 			}

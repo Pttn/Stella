@@ -13,8 +13,8 @@ Since this is a prototype software, a lot of the usage instructions is subject t
 The Stella interface relies on the Rug's Integer structure, so add the following to your `Cargo.toml` in order to use the Crate:
 
 ```
-rug = "^1.19.0"
-stella = "0.0.2"
+rug = "^1.19.2"
+stella = "0.0.3"
 ```
 
 Optionally, you can use the following imports in your source files, we will assume that you did that below.
@@ -36,25 +36,23 @@ let mut stella = Stella::new();
 
 Now, the instance must be configured via a struct called `Params`, using the `set_params` method. Here are the fields of this structure:
 
-* `workers: usize`: number of workers to use for the search. Set this to `0` to autodetect the number of threads in your machine;
-* `constellation_pattern: Vec<isize>`: which sort of constellations to look for, as (cumulative) offsets separated by commas. Set this to an empty Vector to use the default pattern `0, 2, 6, 8, 12, 18, 20`;
-* `target: Integer`: sets the target as a Rug Integer, the prime constellation search will start at this number. Set this to `0` to use the default target of 2^1024;
-* `prime_table_limit`: the prime table used for searching prime constellations will contain primes up to the given number. Set this to `0` to use the default limit of `16777216`;
-* `primorial_number`: the Primorial Number for the sieve process. Higher is better, but for practical reasons it should be such that the actual primorial is a bit smaller than the target. Set this to `0` to use the default value of `120`;
-* `primorial_offset`: the offset from a primorial multiple to use for the sieve process. Set this `0` to choose automatically a hardcoded one associated to the pattern;
-* `sieve_size`: the size of the primorial factors table for the sieve in bits. It will be rounded up to the next multiple of the machine's word size if needed. Set this to `0` to use the default size of 2^25;
+* `workers: usize`: number of workers to use for the search. Set this to `0` or omit it to autodetect the number of threads in your machine;
+* `constellation_pattern: Vec<isize>`: which sort of constellations to sieve for, as (cumulative) offsets separated by commas. Set this to an empty Vector or omit it to use the default pattern `0, 2, 6, 8, 12, 18, 20`;
+* `prime_table_limit`: the prime table used for searching prime constellations will contain primes up to the given number. Set this to `0` or omit it to use the default limit of `16777216`;
+* `primorial_number`: the Primorial Number for the sieve process. It should be such that the actual primorial is a few orders of magnitude smaller than the job targets. Set this to `0` or omit it to use the default value of `120`;
+* `primorial_offset`: the offset from a primorial multiple to use for the sieve process. Set this `0` or omit it to choose automatically a hardcoded one associated to the pattern;
+* `sieve_size`: the size of the primorial factors table for the sieve in bits. It will be rounded down to the previous multiple of the machine's word size if needed. Set this to `0`or omit it to use the default size of 2^25;
 
-Here is an example of a configuration of the Stella instance,
+To be able to omit parameters, use `..Default::default()`. The chosen parameters should be suitable for the jobs that are going to be handled by the Stella instance. Here is an example of a configuration, compatible with the parameters above,
 
 ```
 stella.set_params(stella::Params {
 	workers: 8,
 	constellation_pattern: vec![0, 2, 6, 8, 12, 18, 20, 26],
 	prime_table_limit: 10000000,
-	primorial_number: 20,
-	primorial_offset: 380284918609481,
-	target: Integer::from(1) << 128,
-	sieve_size: 10000000
+	primorial_number: 100,
+	sieve_size: 10000000,
+	..Default::default() // Use this if you don't want to set some parameters (like primorial_offset here)
 });
 ```
 
@@ -68,13 +66,39 @@ stella.init();
 
 ### Starting Workers
 
-Actual number crunching can now be started with
+Start workers with
 
 ```
 stella.start_workers();
 ```
 
-This launches detached worker threads that will look for prime constellations as configured above. Since the workers are detached threads, a main thread must also be run by the library user. In order to view statistics and handle results found by the Stella instance, read the sections below.
+This launches detached worker threads that will look for prime constellations once some valid jobs are added to the instance. Since the workers are detached threads, a main thread must also be run by the library user. In order to add jobs, view statistics, and handle results found by the Stella instance, read the sections below.
+
+### Jobs
+
+A job can be submitted to the Stella instance using the a struct called `Params` and the `add_job` method. Here are the fields of this structure:
+
+* `id: usize`: an identifier for the job that must be unique;
+* `clear_previous_jobs: bool`: whether to clear active jobs in the Stella instance;
+* `pattern: Vec<isize>`: the target pattern for the outputs, which may differ from the one we are sieving for but must not be longer;
+* `target_min: Integer`: the lower bound for the base prime number;
+* `target_max: Integer`: the upper bound for the base prime number;
+* `k_min: usize`: how many numbers in the target pattern must be prime in order for the tuple to be outputted;
+* `pattern_min: Vec<bool>`: a vector that must be of the same size as the target pattern. True requires that the number at this position in the tuple is prime and false allows it to not be prime, in order for the tuple to be outputted.
+
+All the fields must be set. The `add_job` method does some basic sanity checks and returns a couple of vectors of `String`s containing possible warnings or errors. If there were errors, the job is ignored by the Stella instance. Here is an usage example of the method and structure,
+
+```
+let (warnings, errors) = stella.add_job(stella::Job {
+	id: 1,
+	clear_previous_jobs: true,
+	pattern: vec![0, 2, 6, 8, 12, 18, 20],
+	target_min: Integer::from(1) << 1024,
+	target_max: (Integer::from(1) << 1024) + (Integer::from(1) << 768),
+	k_min: 5,
+	pattern_min: vec![true ; 7]
+});
+```
 
 ### Stats
 
@@ -91,11 +115,11 @@ Once the Stella instance is initialized, you can access some relevant statistics
 
 ### Outputs
 
-When a result of interest is found by the Stella instance (actual prime k-tuplet, long enough tuple, or pool share depending on the use case and configuration), it is internally pushed to a queue. Using the `pop_output` methode, you can retrieve an output from the queue and "consume" it. It is presented as an `Output` structure containing the following fields:
+When a result fulfilling the job's conditions is found by the Stella instance, it is internally pushed to a queue. Using the `pop_output` method, you can retrieve an output from the queue and "consume" it. It is presented as an `Output` structure containing the following fields:
 
 * `n: Integer`: the base number of the tuple;
-* `k: usize`: can represent the number of consecutive primes starting from the first number, or something else depending on how the instance was configured (like the Share Prime Count in Pooled Mining);
-* `constellation_pattern: Vec<isize>`: with which pattern this result is associated;
+* `pattern: Vec<isize>`: at which offsets of the target pattern the number is prime;
+* `id: usize`: the job Id this output is associated to;
 * `worker_id: usize`: the internal id of the worker that found the result.
 
 ### Example Program
@@ -129,6 +153,7 @@ Donations to the Riecoin Project are welcome:
 
 * [Riecoin website](https://Riecoin.dev/)
 * [Stella's Topic on the Riecoin Forum](https://forum.riecoin.dev/viewtopic.php?t=114)
+* [Stella crate on Crates.io](https://crates.io/crates/Stella)
 * [rieMiner's page](https://riecoin.dev/en/rieMiner)
 * [Explanation of the miner's algorithm](https://riecoin.dev/en/Mining_Algorithm)
 * [Stella, the Riecoin's PoW](https://riecoin.dev/en/Stella)
